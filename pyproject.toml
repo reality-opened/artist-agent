@@ -1,0 +1,16 @@
+[project]
+name = "artist-agent"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+    "cv2-enumerate-cameras>=1.4.0",
+    "lerobot[feetech]~=0.6.1",
+    "mcp>=2.3,<3",
+    "pyorbbecsdk2==2.1.2",
+]
+
+[tool.uv]
+# lerobot lists the `cmake` wheel as a core dependency but never imports it (install-time only).
+# On this PC the 360 / Huorong antivirus blocks uv.exe from extracting that wheel
+# (os error 5 on Templates/CPack.GenericDescription.txt), so drop it with a never-true marker.
+override-dependencies = ["cmake; sys_platform == 'never'"]
