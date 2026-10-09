@@ -1,0 +1,19 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Orbbec SDK runtime log, written to the working directory
+Log/
+
+# per-run output of tests/hardware_check.py
+tests/hardware_runs/
+
+# OpenCode plugin session state
+.omo/
