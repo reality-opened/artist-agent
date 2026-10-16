@@ -72,6 +72,21 @@ def test_monitor_flags_a_slid_camera_and_refits_it_from_ordinary_rests() -> None
     arm.disconnect()
 
 
+def test_no_verdict_with_open_jaws_or_a_rolled_wrist() -> None:
+    rig, arm, auto = make()
+    roll = arm.rest_pose_deg["wrist_roll"]
+    for targets in ({"gripper": 80.0}, {"gripper": 20.0, "wrist_roll": roll - 60.0}):
+        r = arm.move_joints(targets, speed_dps=40)
+        assert r.status in ("reached", "settled"), r
+        what = auto.poll(time.monotonic())
+        assert what.startswith("no look") and not auto.rests and auto.last_miss is None, (targets, what)
+    arm.move_joints({"wrist_roll": roll}, speed_dps=40)
+    what = auto.poll(time.monotonic())
+    assert not what.startswith("no look"), what
+    print("  open jaws / rolled wrist: no look; back as calibrated:", what)
+    arm.disconnect()
+
+
 def _plane(rig):
     _, depth, K = rig.rgbd(frames=2)
     return rig.bench_plane(depth, K)

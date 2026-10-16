@@ -19,6 +19,7 @@ import numpy as np
 
 import vision
 from calibration import Sample, align_z, gripper_poses, kabsch, make_rig, solve_camera
+from kinematics import JOINTS
 
 CELL_MM, MAX_RESTS, MAX_AGE_S = 40.0, 30, 1800.0  # one rest per 40 mm cell of marker positions, newest wins
 GATE_MM, EDGE_PX, STILL_DEG = 60.0, 40.0, 0.2
@@ -27,6 +28,10 @@ RIGID_FIT_MM, RIGID_SHIFT_MM, RIGID_TURN_DEG = 8.0, 12.0, 1.0
 ADOPT_GAIN, ADOPT_SHIFT_MM, ADOPT_RMS_MM, ADOPT_MAX_MM, YAW_SIGMA_DEG = 0.7, 4.0, 8.0, 20.0, 0.5
 SWEEP_IDLE_S, SWEEP_GAP_S, SWEEP_ATTEMPTS, SWEEP_CLEAR_MM = 120.0, 600.0, 2, 100.0
 RECHECK_S = 300.0  # look again at an unchanged pose this often: a camera bumped while the arm sits still
+# Looks only with the jaws as calibrated (tape on the fixed jaw, wrist near its rest roll): on 2026-10-16 an open gripper
+# showed the other jaw's tape ~45 mm off and a wrist rolled 94 deg showed another face of the tape 15-25 mm off, and the
+# monitor called the camera moved.
+LOOK_MAX_GRIP_PCT, LOOK_ROLL_SPAN_DEG = 40.0, 30.0
 
 
 @dataclass
@@ -64,7 +69,7 @@ class AutoCalibration:
         self.epoch = 0
         self._lock = threading.RLock()
         now = clock()
-        self._last_pose, self._last_look, self._last_eval, self._last_tool = None, -np.inf, now, now
+        self._last_pose, self._last_grip, self._last_look, self._last_eval, self._last_tool = None, None, -np.inf, now, now
         self._sweeps: list[float] = []
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
@@ -150,9 +155,10 @@ class AutoCalibration:
         if arm.moving:
             return "moving"
         q, grip = arm.joints_now()
-        moved = self._last_pose is None or np.abs(np.subtract(q, self._last_pose)).max() > 2.0
+        moved = (self._last_pose is None or np.abs(np.subtract(q, self._last_pose)).max() > 2.0
+                 or abs(grip - self._last_grip) > 5.0)
         if moved or now - self._last_look >= RECHECK_S:
-            self._last_pose, self._last_look = q, now
+            self._last_pose, self._last_grip, self._last_look = q, grip, now
             what = self._look(arm, q, grip, now)
         else:
             what = "same pose"
@@ -164,6 +170,11 @@ class AutoCalibration:
 
     # --- one look ----------------------------------------------------------------------------------------------
     def _look(self, arm, q, grip, now) -> str:
+        if grip > LOOK_MAX_GRIP_PCT:
+            return f"no look: the gripper is open past {LOOK_MAX_GRIP_PCT:.0f} %"
+        rest_roll = (arm.rest_pose_deg or {}).get("wrist_roll")
+        if rest_roll is not None and abs(q[JOINTS.index("wrist_roll")] - rest_roll) > LOOK_ROLL_SPAN_DEG:
+            return f"no look: the wrist is rolled more than {LOOK_ROLL_SPAN_DEG:.0f} deg from rest"
         cal = arm.rig
         T = gripper_poses(arm.kin, q, arm.offsets)[0]
         base = T[:3, :3] @ np.asarray(cal.marker_in_gripper_mm, float) + T[:3, 3]
