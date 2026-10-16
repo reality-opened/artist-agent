@@ -44,6 +44,7 @@ async def scenario() -> None:
 
             st = data(await session.call_tool("arm_status", {}))
             assert st["calibration_ok"] and st["busy"] is False and "simulation" in st["rig_calibration"], st
+            assert st["session_reset"] == "session start: parked (reached)", st["session_reset"]
             assert st["tcp_above_bench_mm"] > 100, st["tcp_above_bench_mm"]
 
             refused = await session.call_tool("release_torque", {"which": "all"})
@@ -99,8 +100,11 @@ async def scenario() -> None:
             for name in ("calibrate_camera", "calibrate_rig"):
                 refused = await session.call_tool(name, {})
                 assert refused.is_error and "confirm=true" in text(refused), text(refused)
+            data(await session.call_tool("set_gripper", {"opening_pct": 90}))
             cal = data(await session.call_tool("calibrate_camera", {"confirm": True}))
             print(f"  calibrate_camera: {cal['poses']} poses, rms {cal['rms_mm']} mm -> {cal['saved']}")
+            grip = data(await session.call_tool("arm_status", {}))["gripper_opening_pct"]
+            assert abs(grip - 20) < 5, f"calibrate_camera left the gripper at {grip} %"
             # bench height pinned: the 10 mm ball's front-surface bias along the bench normal stays in the residual
             assert cal["status"] == "calibrated" and cal["rms_mm"] < 5.0 and "artist-agent-sim-rig" in cal["saved"], cal
             again = data(await session.call_tool("find_objects", {}))
@@ -121,6 +125,31 @@ def test_mcp_session_in_sim() -> None:
     asyncio.run(scenario())
 
 
+def test_session_start_parks_once() -> None:
+    import argparse
+
+    import server
+    from arm import JOINTS
+
+    rig = server.Rig(argparse.Namespace(sim=True, gemini_serial="SIM"))
+    arm = rig.arm
+    rest = dict(arm.rest_pose_deg)
+    left = arm.move_joints({"shoulder_pan": rest["shoulder_pan"] + 20, "elbow_flex": rest["elbow_flex"] - 15,
+                            "gripper": 80}, speed_dps=40)  # where a previous session might have left it
+    assert left.status in ("reached", "settled"), left
+    rig.session_reset()
+    st = arm.state()
+    assert all(abs(st.joints_deg[m] - rest[m]) < 1.5 for m in JOINTS), (st.joints_deg, rest)
+    assert abs(st.gripper_opening_pct - server.RESET_GRIPPER_PCT) < 5, st.gripper_opening_pct  # set_gripper: 2 deg
+    assert rig.reset_note == "session start: parked (reached), gripper closed to 20 % (reached)", rig.reset_note
+    arm.move_joints({"shoulder_pan": rest["shoulder_pan"] + 10}, speed_dps=40)
+    rig.session_reset()  # once per server process: later calls leave the arm where the agent put it
+    assert abs(arm.state().joints_deg["shoulder_pan"] - rest["shoulder_pan"] - 10) < 1.5
+    arm.disconnect()
+
+
 if __name__ == "__main__":
+    test_session_start_parks_once()
+    print("ok test_session_start_parks_once")
     test_mcp_session_in_sim()
     print("ok test_mcp_session_in_sim")

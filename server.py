@@ -35,8 +35,12 @@ find_marker also give base-frame points that move_to can go to directly (open lo
 frame_note saying the camera moved, base-frame points are withheld: run calibrate_camera, or stay in the camera
 frame with servo_to, which learns the mapping by moving and gets within ~5 mm. calibrate_rig redoes everything
 (joint offsets too) after the motors were recalibrated. A monitor (auto_calibration) compares the camera's view of
-the gripper with the calibration whenever the arm rests: it notes suspect base-frame points, withholds them when the
-camera has moved, and re-fits the camera from those rests by itself.
+the gripper with the calibration whenever the arm rests with the jaws as calibrated (gripper at most 40 % open, wrist
+within 30 deg of its rest roll): it notes suspect base-frame points, withholds them when the camera has moved, and
+re-fits the camera from those rests by itself.
+
+A session starts from the rest pose: its first tool call (any but stop, release_torque and auto_calibration) first
+parks the arm and closes a wide-open gripper to 20 %, wherever the last session left it (arm_status.session_reset).
 
 Every motion blocks until it ends and returns a receipt; read its status before the next step. One motion at a
 time (a second one is refused as busy); stop() works during a motion. Moves that would bring the gripper close
@@ -49,6 +53,8 @@ with confirm=true.
 
 REACH_MM = 650.0  # objects further than this from the base (horizontally) are not reported
 APPROACH_MM = 60.0
+RESET_GRIPPER_PCT = 20.0
+NO_RESET = frozenset({"stop", "release_torque", "auto_calibration"})  # tools that never trigger the session-start park
 
 
 @dataclass
@@ -118,12 +124,17 @@ class Rig:
         self._wrist = None
         self.marker: np.ndarray | None = None
         self.marker_px: tuple[float, float] | None = None
-        self.marker_spec = dict(hue=(100, 125), min_sat=70, min_mm=200, max_mm=650)
+        # min_val 65, not vision's 80: the dark navy tip tape (2026-10-16) has brightness 66-106, so 80 kept ~54-113 px of
+        # its ~700 and the camera sweep lost it; 65 gives one ~400 px blob, while 50 also let in a navy bottle cap.
+        self.marker_spec = dict(hue=(100, 125), min_sat=70, min_val=65, min_mm=200, max_mm=650)
         self.objects: list[vision.BenchObject] = []
         self.jacobian = None
         self.serial = "SIM" if args.sim else args.gemini_serial
         self.holding = False  # the last grasp held something and the jaws have not opened since
         self.auto = None  # the camera-link monitor (autocal.AutoCalibration), set by build()
+        self.reset_note: str | None = None
+        self._reset_lock = threading.Lock()
+        self._reset_done = False
 
     @property
     def opened(self) -> bool:
@@ -154,6 +165,26 @@ class Rig:
                     self._arm = Arm.open(self.args.port, self.args.robot_id,
                                          rest_pose_deg=dict(zip(JOINTS, self.args.rest_pose)))
             return self._arm
+
+    def session_reset(self) -> None:
+        """Once per server process (one agent session), before its first tool that uses the hardware: park, then close
+        a wide-open gripper to RESET_GRIPPER_PCT, wherever the last session left the arm. Never opens the jaws (they may
+        hold something). A refused or failed park lands in reset_note instead of failing the tool; stop() halts it."""
+        with self._reset_lock:
+            if self._reset_done:
+                return
+            arm = self.arm
+            arm.connect()  # a busy port reaches the agent as an error, and its next call tries again
+            self._reset_done = True
+            try:
+                parked = arm.park()
+                note = f"parked ({parked.status})"
+                if parked.status in ("reached", "settled") and arm.joints_now()[1] > RESET_GRIPPER_PCT + 5:
+                    closed = arm.set_gripper(RESET_GRIPPER_PCT)
+                    note += f", gripper closed to {RESET_GRIPPER_PCT:.0f} % ({closed.status})"
+            except (ArmError, ConnectionError, TimeoutError) as e:
+                note = f"not parked: {e}"
+            self.reset_note = f"session start: {note}"
 
     def gemini(self):
         if self.args.sim:
@@ -274,12 +305,15 @@ def build(args) -> MCPServer:
     rig.auto = auto
 
     def tool(fn):
-        """Register fn; refusals and device errors reach the agent as readable ToolErrors (MCP masks the rest)."""
+        """Register fn; refusals and device errors reach the agent as readable ToolErrors (MCP masks the rest). Unless
+        fn is in NO_RESET, the session-start park runs before it."""
 
         @functools.wraps(fn)
         def guarded(*a, **kw):
             auto.touch()
             try:
+                if fn.__name__ not in NO_RESET:
+                    rig.session_reset()
                 return fn(*a, **kw)
             except (RuntimeError, ConnectionError, TimeoutError, ValueError) as e:
                 hint = " (the monitor's calibrate_camera sweep is running: stop() halts it)" \
@@ -292,9 +326,11 @@ def build(args) -> MCPServer:
     def arm_status() -> ArmState:
         """Joint angles (deg), gripper opening (%), model TCP (base mm) and its height above the bench, torque,
         temperatures, loads, limits, rig calibration, the camera-link monitor (auto_calibration), safety flags
-        (calibration_ok, thermal_lockout, busy). Read-only; call it first."""
+        (calibration_ok, thermal_lockout, busy), and how the session-start park went (session_reset). Call it first:
+        as a session's first call it runs that park; after that it only reads."""
         st = rig.arm.state()
         st.auto_calibration = auto.summary()
+        st.session_reset = rig.reset_note
         return st
 
     @tool
@@ -310,14 +346,17 @@ def build(args) -> MCPServer:
                 tol_mm: float = 10.0) -> CartesianReceipt:
         """Move the gripper TCP along a straight line to a base-frame point (mm). The whole line is solved before
         anything moves; a line that needs an IK branch flip, passes near the bench or ends too stretched out for the
-        shoulder to lift is refused. jaws_down also
-        points the jaws at the bench. status off_target = joints stopped inside their deadband short of the point."""
+        shoulder to lift is refused. jaws_down turns the jaws toward straight down along the way, without twisting
+        them (wrist_roll is kept): the wrist reaches straight down only low over the bench (on this arm from about
+        4 cm up, 20-30 cm out), so higher up the jaws stay tilted as near down as it goes, and the receipt's notes
+        say by how much (jaw_axis [0, 0, -1] = straight down); descending with jaws_down straightens them.
+        status off_target = joints stopped inside their deadband short of the point."""
         return rig.arm.move_to([x_mm, y_mm, z_mm], jaws_down, speed_deg_s, tol_mm)
 
     @tool
     def move_by(dx_mm: float, dy_mm: float, dz_mm: float, jaws_down: bool = False, speed_deg_s: float = 20.0,
                 tol_mm: float = 10.0) -> CartesianReceipt:
-        """Move the gripper TCP by a base-frame offset (mm): +z is up, away from the bench."""
+        """Move the gripper TCP by a base-frame offset (mm): +z is up, away from the bench. jaws_down as in move_to."""
         return rig.arm.move_by([dx_mm, dy_mm, dz_mm], jaws_down, speed_deg_s, tol_mm)
 
     @tool
@@ -429,11 +468,13 @@ def build(args) -> MCPServer:
 
     @tool
     def find_marker(hue_low: int = 100, hue_high: int = 125, min_saturation: int = 70, near_mm: float = 200.0,
-                    far_mm: float = 650.0, confirm_by_motion: bool = True) -> MarkerReport:
-        """Lock onto the coloured tape on the gripper (OpenCV hue 0..179; default blue tape). With
+                    far_mm: float = 650.0, confirm_by_motion: bool = True, min_value: int = 65) -> MarkerReport:
+        """Lock onto the coloured tape on the gripper (OpenCV hue 0..179; default blue tape; min_value = brightness
+        floor 0..255, lower it for dark tape or a dim room). With
         confirm_by_motion the arm lifts 15 mm and returns, and only the blob that moved with it is accepted, so a
         same-coloured object elsewhere cannot be mistaken for the gripper."""
-        rig.marker_spec = dict(hue=(hue_low, hue_high), min_sat=min_saturation, min_mm=near_mm, max_mm=far_mm)
+        rig.marker_spec = dict(hue=(hue_low, hue_high), min_sat=min_saturation, min_val=min_value, min_mm=near_mm,
+                               max_mm=far_mm)
         blobs = rig.blobs()
         if not blobs:
             raise ArmError("no blob of that colour within the depth window: check look() and the hue band")
@@ -476,8 +517,9 @@ def build(args) -> MCPServer:
 
     @tool
     def calibrate_camera(confirm: bool = False) -> CalibrationReport:
-        """Re-measure the camera pose after the camera was moved or bumped (frame_note says so). Parks, locks the
-        marker by moving it, then moves the arm through ~14 poses around the rest pose (~1.5 min); keeps the arm's
+        """Re-measure the camera pose after the camera was moved or bumped (frame_note says so). Parks, closes a
+        wide-open gripper to 20 %, locks the marker by moving it, then moves the arm through ~14 poses around the rest
+        pose (~1.5 min); keeps the arm's
         joint offsets, the marker on the gripper and the bench height, saves a new versioned rig calibration and uses
         it at once. The arm ends parked. Requires confirm=true."""
         if not confirm:
@@ -489,9 +531,11 @@ def build(args) -> MCPServer:
     @tool
     def calibrate_rig(confirm: bool = False) -> CalibrationReport:
         """Full calibration: the arm's joint offsets, the marker on the gripper and the camera pose, from ~45 poses in
-        three widening stages around the rest pose (~5 min). Needed after the motors were recalibrated or the marker
-        tape moved; when only the camera moved, calibrate_camera is quicker. Parks, locks the marker by moving it,
-        sweeps, and refuses a fit that predicts held-out poses worse than 12 mm (the old calibration then stays).
+        three widening stages around the rest pose plus 8 with the jaws down near the bench, 6-11 cm over it and
+        23-30 cm out (~6 min). Needed after the motors were recalibrated or the marker
+        tape moved; when only the camera moved, calibrate_camera is quicker. Parks, closes a wide-open gripper to 20 %,
+        locks the marker by moving it, sweeps, and refuses a fit that predicts held-out poses worse than 12 mm (the old
+        calibration then stays).
         Saves a versioned rig calibration and uses it at once. Requires confirm=true and a clear space around the arm."""
         if not confirm:
             raise ArmError("calibrate_rig moves the arm through ~45 poses for about 5 minutes: call again with "
@@ -508,8 +552,11 @@ def build(args) -> MCPServer:
             parked = arm.park()
             if parked.status not in ("reached", "settled"):
                 raise ArmError(f"could not park before calibrating: {parked.status} {parked.notes}")
+            if not rig.holding and arm.joints_now()[1] > RESET_GRIPPER_PCT + 5:
+                arm.set_gripper(RESET_GRIPPER_PCT)  # the tape is calibrated with the jaws nearly closed
             spec = rig.marker_spec
-            find_marker(spec["hue"][0], spec["hue"][1], spec["min_sat"], spec["min_mm"], spec["max_mm"])
+            find_marker(spec["hue"][0], spec["hue"][1], spec["min_sat"], spec["min_mm"], spec["max_mm"],
+                        min_value=spec["min_val"])
 
             def bench():
                 _, depth, K = rig.rgbd(frames=5)
