@@ -135,8 +135,9 @@ def test_full_sweep_recovers_the_rig_from_a_prior_in_simulation() -> None:
 
     (only,) = tape_now()
     locked["p"] = vision.front_point(only)
-    stages = tuple(stage[::3] for stage in calib.FULL_SWEEP)
-    rig = calib.full_calibration(arm, read_marker, bench, "sim", "SIM", stages=stages, speed_dps=40.0, min_samples=12)
+    stages = tuple(stage[::2] for stage in calib.FULL_SWEEP)  # [::3] kept one rolled-wrist pose: leave-one-out 22-55 mm
+    rig = calib.full_calibration(arm, read_marker, bench, "sim", "SIM", stages=stages, bench=calib.BENCH_SWEEP[::2],
+                                 speed_dps=40.0, min_samples=12)
     err = np.abs(rig.offsets_array() - truth)[1:4]
     print(f"  {len(rig.samples)} poses: offsets off by {np.round(err, 2).tolist()} deg (lift, elbow, wrist); {rig.notes[0]}")
     assert err.max() < 1.5, err

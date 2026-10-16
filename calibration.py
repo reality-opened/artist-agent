@@ -420,6 +420,11 @@ FULL_SWEEP = (
      {"shoulder_pan": 18, "shoulder_lift": 14, "elbow_flex": -30, "wrist_flex": -5}, {}),
 )
 FLOOR_PREDICTED_MM, FLOOR_MEASURED_MM = 45.0, 30.0  # marker height above the bench: skip below / stop below
+# Then base-frame TCP points (mm) near the bench, reached with the jaws down by straight lines: where objects are picked
+# up. The joint stages keep the jaws forward-down near rest, and a fit from them alone missed these poses by 10-12 mm
+# (2026-10-16). Kept 3 cm from that day's check poses, x >= 235 clear of a block left at x <= 208.
+BENCH_SWEEP = ((235, -30, 65), (250, -95, 85), (270, -45, 75), (290, -20, 90), (240, 15, 70), (265, 30, 80),
+               (280, 55, 95), (295, 35, 110))
 
 
 def _marker_mm(arm, readings_deg, g_mm) -> np.ndarray:
@@ -440,15 +445,16 @@ def leave_one_out_mm(kin: Kinematics, readings_deg, marker_cam, bench_n_cam, fit
 
 
 def full_calibration(arm, read_marker, bench_plane, motor_calibration_sha256: str, camera_serial: str,
-                     robot_id: str = "exp23_follower", stages=FULL_SWEEP, speed_dps=10.0, min_samples=20,
-                     max_loo_mm=12.0, say=lambda *_: None) -> RigCalibration:
+                     robot_id: str = "exp23_follower", stages=FULL_SWEEP, bench=BENCH_SWEEP, speed_dps=10.0,
+                     min_samples=20, max_loo_mm=12.0, say=lambda *_: None) -> RigCalibration:
     """Joint offsets, the marker on the gripper and the camera pose, from a staged sweep around the rest pose.
 
     read_marker(prior_cam_mm | None, gate_mm) -> camera position of the marker blob nearest the prior (None = the
     locked marker), or None. The first stage tracks the marker from pose to pose (the old camera pose may be stale);
     each later stage looks where the model fitted so far predicts it, and that model also drives the arm's bench
-    guard. Start at the rest pose with the marker locked there. The arm ends where it started. A fit whose
-    leave-one-out error exceeds max_loo_mm is refused, and the arm goes back to the calibration it had."""
+    guard. Then the `bench` points with the jaws down, by straight lines, and 50 mm up again. Start at the rest pose
+    with the marker locked there. The arm ends where it started. A fit whose leave-one-out error exceeds max_loo_mm is
+    refused, and the arm goes back to the calibration it had."""
     from arm import ArmError, LimitError
 
     original, start = arm.rig, arm.state().joints_deg
@@ -461,6 +467,23 @@ def full_calibration(arm, read_marker, bench_plane, motor_calibration_sha256: st
     if arm.rig is None:
         arm.use_model(FIELD_OFFSETS_DEG, 0.0)
     readings, cams, skipped, model = [], [], 0, None
+
+    def take(q, what: str) -> None:
+        """Look for the marker where the model so far puts it (else near the last sighting) and keep the sample."""
+        nonlocal prev
+        p = None
+        if model is not None:
+            p = read_marker(model["R"] @ _marker_mm(arm, q, model["g"]) + model["t"], 60.0)
+        p = p if p is not None else read_marker(prev, 150.0)
+        if p is None:
+            say(f"{what}: marker not seen")
+            return
+        if plane.height(p) < FLOOR_MEASURED_MM:
+            raise RuntimeError(f"the marker came {plane.height(p):.0f} mm from the bench at {what}: stopped")
+        readings.append(q)
+        cams.append(np.asarray(p, float))
+        prev = p
+
     try:
         for k, stage in enumerate(stages):
             for off in stage:
@@ -477,24 +500,28 @@ def full_calibration(arm, read_marker, bench_plane, motor_calibration_sha256: st
                     continue
                 if r.status not in ("reached", "settled"):
                     raise RuntimeError(f"calibration move {off} ended {r.status}: {r.notes or r.blocked or ''}")
-                q = [r.final[m] for m in JOINTS]
-                p = None
-                if model is not None:
-                    p = read_marker(model["R"] @ _marker_mm(arm, q, model["g"]) + model["t"], 60.0)
-                p = p if p is not None else read_marker(prev, 150.0)
-                if p is None:
-                    say(f"pose {off}: marker not seen")
-                    continue
-                if plane.height(p) < FLOOR_MEASURED_MM:
-                    raise RuntimeError(f"the marker came {plane.height(p):.0f} mm from the bench at pose {off}: stopped")
-                readings.append(q)
-                cams.append(np.asarray(p, float))
-                prev = p
+                take([r.final[m] for m in JOINTS], f"pose {off}")
             if len(cams) >= 8:
                 model = best_fit(arm.kin, np.array(readings), np.array(cams), plane.n, level=True)
                 arm.use_rig(make_rig(model, [], plane.n, plane.d, robot_id, motor_calibration_sha256, camera_serial,
                                      notes=[f"provisional, after stage {k + 1} of {len(stages)}"]))
                 say(f"stage {k + 1}: {len(cams)} samples, rms {model['rms']:.1f} mm")
+        for xyz in bench:
+            if xyz[2] - arm.bench_z < FLOOR_PREDICTED_MM:
+                skipped += 1
+                continue
+            try:
+                r = arm.move_to(xyz, jaws_down=True, speed_dps=speed_dps)
+            except LimitError as e:
+                skipped += 1
+                say(f"bench point {xyz} skipped: {e}")
+                continue
+            if r.status not in ("reached", "off_target"):
+                raise RuntimeError(f"calibration move to {xyz} ended {r.status}: {r.move.notes or r.move.blocked or ''}")
+            take([r.move.final[m] for m in JOINTS], f"bench point {xyz}")
+        if bench:
+            with contextlib.suppress(ArmError):  # up first: the way back to the start is a joint move
+                arm.move_by([0.0, 0.0, 50.0], jaws_down=True, speed_dps=speed_dps)
         if len(cams) < min_samples:
             raise ValueError(f"only {len(cams)} poses saw the marker (need {min_samples}; {skipped} skipped): keep "
                              "the gripper in the camera's view from the rest pose")
