@@ -16,6 +16,7 @@ from lerobot.motors import MotorCalibration
 URDF = Path(__file__).parent / "urdf" / "so101_new_calib.urdf"
 JOINTS = ("shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex", "wrist_roll")
 TICKS_PER_TURN = 4095  # LeRobot's degree conversion divides by STS3215 resolution - 1
+DOWN = np.array([0.0, 0.0, -1.0])  # the jaw axis pointing straight at the bench
 
 
 def _floats(text: str) -> np.ndarray:
@@ -124,12 +125,27 @@ def joint_bounds_deg(
     return np.array(lo), np.array(hi)
 
 
-def _dls(kin: Kinematics, q, target, down: bool, lo, hi, w: float):
+def angle_from_down(axis) -> float:
+    """Degrees between a jaw axis and straight down."""
+    return float(np.degrees(np.arccos(np.clip(-np.asarray(axis, float)[2] / np.linalg.norm(axis), -1.0, 1.0))))
+
+
+def toward_down(axis, t: float) -> np.ndarray:
+    """The jaw axis a fraction t of the way from `axis` to straight down, along the great circle."""
+    a = np.asarray(axis, float) / np.linalg.norm(axis)
+    theta = np.radians(angle_from_down(a))
+    if theta < 1e-6:
+        return DOWN.copy()
+    v = (np.sin((1 - t) * theta) * a + np.sin(t * theta) * DOWN) / np.sin(theta)
+    return v / np.linalg.norm(v)
+
+
+def _dls(kin: Kinematics, q, target, axis, lo, hi, w: float, pin: bool = False):
     for _ in range(200):
         T = kin.fk(q)
         err = [target - T[:3, 3]]
-        if down:
-            err.append(w * (np.array([0, 0, -1.0]) - T[:3, 2]))
+        if axis is not None:
+            err.append(w * (axis - T[:3, 2]))
         err = np.concatenate(err)
         if np.linalg.norm(err) < 1e-4:
             break
@@ -139,25 +155,37 @@ def _dls(kin: Kinematics, q, target, down: bool, lo, hi, w: float):
             dq[i] = 1e-5
             Tp, Tm = kin.fk(q + dq), kin.fk(q - dq)
             col = [(Tp[:3, 3] - Tm[:3, 3]) / 2e-5]
-            if down:
+            if axis is not None:
                 col.append(w * (Tp[:3, 2] - Tm[:3, 2]) / 2e-5)
             J.append(np.concatenate(col))
         J = np.array(J).T
-        q = np.clip(q + J.T @ np.linalg.solve(J @ J.T + 1e-4 * np.eye(len(err)), err), lo, hi)
+        step = J.T @ np.linalg.solve(J @ J.T + 1e-4 * np.eye(len(err)), err)
+        if pin:  # a joint at its limit and pushed further stays there; the others solve without it
+            stuck = ((q <= lo + 1e-9) & (step < 0)) | ((q >= hi - 1e-9) & (step > 0))
+            if stuck.any():
+                J[:, stuck] = 0.0
+                step = J.T @ np.linalg.solve(J @ J.T + 1e-4 * np.eye(len(err)), err)
+        q = np.clip(q + step, lo, hi)
     T = kin.fk(q)
     return q, np.linalg.norm(target - T[:3, 3])
 
 
-def solve_ik(kin: Kinematics, start_deg, xyz, down: bool, lo_deg, hi_deg, multi_seed: bool = True) -> IKSolution:
+def solve_ik(kin: Kinematics, start_deg, xyz, down: bool, lo_deg, hi_deg, multi_seed: bool = True, axis=None,
+             weights=(0.3, 0.1, 0.03), pin: bool = False) -> IKSolution:
     """Damped least squares on position (+ jaws pointing down), 28 seeds; the solution nearest start wins.
 
     multi_seed=False keeps only the start as a seed: for short, warm-started path segments, it is far
     faster and cannot jump to another IK branch. Raises ValueError when no seed lands within 3 mm, or
     when the result leaves the bounds (possible only if the start itself is out of bounds and on target).
+    With down: axis = the jaw axis to aim for instead of straight down; weights = the orientation weights tried in
+    turn until a seed lands within 3 mm (an axis error of 1 rad costs as much as `weight` metres of position error,
+    so small weights keep the position and get only as near the axis as the joint limits allow). pin: a joint that
+    reaches a limit is held there while the others carry on, instead of the whole step being cut back.
     """
     q0 = np.radians(np.asarray(start_deg, dtype=float))
     lo, hi = np.radians(lo_deg), np.radians(hi_deg)
     target = np.asarray(xyz, dtype=float)
+    want = (DOWN if axis is None else np.asarray(axis, float) / np.linalg.norm(axis)) if down else None
     seeds = [q0]
     if multi_seed:
         seeds += [
@@ -167,8 +195,8 @@ def solve_ik(kin: Kinematics, start_deg, xyz, down: bool, lo_deg, hi_deg, multi_
             for c in (0, 0.8, 1.4)
         ]
     # Prefer jaws straight down; relax toward position-only when out of reach.
-    for w in ((0.3, 0.1, 0.03) if down else (0,)):
-        results = [_dls(kin, s.copy(), target, down, lo, hi, w) for s in seeds]
+    for w in (weights if down else (0,)):
+        results = [_dls(kin, s.copy(), target, want, lo, hi, w, pin) for s in seeds]
         good = [(np.abs(q - q0).sum(), q) for q, cost in results if cost < 0.003]
         if good:
             break
