@@ -32,7 +32,8 @@ from lerobot.motors import MotorCalibration
 from lerobot.robots.so_follower import SO101Follower, SO101FollowerConfig
 
 from calibration import RigCalibration, file_sha256
-from kinematics import JOINTS, TICKS_PER_TURN, IKSolution, Kinematics, joint_bounds_deg, solve_ik
+from kinematics import (JOINTS, TICKS_PER_TURN, IKSolution, Kinematics, angle_from_down, joint_bounds_deg, solve_ik,
+                        toward_down)
 
 GRIPPER = "gripper"
 MOTORS = (*JOINTS, GRIPPER)
@@ -64,8 +65,13 @@ STALL_WINDOW_S, STALL_PROGRESS = 0.3, 3
 # breakaway, which takes up to ~100 ticks of lead), it is blocked when it lags its still-advancing goal by CONTACT_LEAD
 # ticks and covered under CONTACT_FRACTION of the goal's advance over CONTACT_WINDOW_S. Pan at 6 deg/s (2026-10-08):
 # free motion lags ~13 ticks; against a hand the lag grew 33 -> 111 while the joint crept on in stick-slip, which the
-# stall rule only caught 2.7 s in (load 456); replayed, this rule fires 0.9 s in (load 288).
+# stall rule only caught 2.7 s in (load 456); replayed, this rule fires 0.9 s in (load 288). A joint whose goal waited
+# GOAL_PAUSE_S at a waypoint for the other joints has stopped and stuck again, so it gets the breakaway allowance anew
+# (2026-10-16: the elbow mid jaws_down move needed ~90 ticks of lead to go on and was called blocked). A joint still
+# covering CONTACT_CREEP ticks a window is moving on its own, only slower than asked under load (2026-10-16: the elbow
+# lifting the stretched-out arm, 33 ticks in 0.5 s against a 20 deg/s goal); one held by a hand creeps a few ticks.
 CONTACT_WINDOW_S, CONTACT_LEAD, CONTACT_FRACTION, CONTACT_MOVED, CONTACT_MIN_ADVANCE = 0.5, 70, 0.3, 30, 20
+GOAL_PAUSE_S, CONTACT_CREEP = 0.15, 23
 SETTLE_CYCLES, SETTLE_TIMEOUT_S = 3, 4.0
 # Sag/stiction compensation (ticks/s; lead cap as a leash fraction). The real elbow needed ~100 ticks of lead (load
 # ~370 of 500) to break free on small moves, in both directions, so the cap sits just under torque saturation.
@@ -76,6 +82,13 @@ WARN_C, LOCKOUT_C, RELEASE_C, GRIPPER_RELAX_C = 50, 58, 66, 55
 PLAUSIBLE_C = (5, 100)
 CONSECUTIVE = 3
 MAX_SEGMENT_MM = 30.0
+# jaws_down: the wrist_flex range (EEPROM 1710..3790, 90.5 deg at the top) cannot point the jaws straight down with the
+# TCP high over the bench (2026-10-16, this rig: 15 deg short at 9 cm up 26 cm out, straight down from ~4 cm up), so a
+# jaws_down line turns the jaws toward down by at most MAX_TURN_DEG per segment and ends as near down as the wrist goes.
+MAX_TURN_DEG = 10.0
+TURN_SWING = 2.5  # deg of joint swing a segment may add per deg the jaws turn in it (the shoulder takes ~2x the turn)
+JAWS_DOWN_WEIGHTS = (0.3, 0.01)  # solve_ik: exactly down where that fits, else on the line and as near down as it gets
+JAWS_DOWN_TOL_DEG = 3.0  # a receipt notes jaws left further than this from straight down
 CLEAR_TIP_MM, CLEAR_LINK_MM = 8.0, 25.0  # least height above the bench: TCP/marker, and wrist/gripper link origins
 CLEARANCE_SAMPLES = 8  # poses checked along a joint move
 # Static gravity torque (URDF masses + the wrist camera) the shoulder can still lift at Torque_Limit 500 on this 5.3 V
@@ -175,6 +188,7 @@ class ArmState:
     gripper_relaxed: bool
     watchdog_error: str | None
     auto_calibration: str | None = None  # the server's camera-link monitor, when it runs one
+    session_reset: str | None = None  # the server's park at the start of an agent session
 
 
 class Arm:
@@ -558,6 +572,7 @@ class Arm:
             origin = dict(pos)
             track = {m: deque([(t0, pos[m], goal[m])]) for m in motors}  # for the in-motion contact rule
             pinned_since: dict[str, float] = {}
+            waiting_since: dict[str, float] = {}  # goals parked at their waypoint while other joints catch up
             last, next_slow = t0, t0
             while status is None:
                 now = time.monotonic()
@@ -571,6 +586,10 @@ class Arm:
                 target = path[seg]
                 if settle_start is None:
                     for m in motors:
+                        if abs(goal[m] - target[m]) < 0.5:
+                            waiting_since.setdefault(m, now)
+                        elif m in waiting_since and now - waiting_since.pop(m) >= GOAL_PAUSE_S:
+                            origin[m] = pos[m]  # it stopped behind its parked goal: going on is a fresh breakaway
                         leash = GRIPPER_LEASH if m == GRIPPER else LEASH
                         step = float(np.clip(target[m] - goal[m], -speed_tps * dt, speed_tps * dt))
                         if step > 0:
@@ -626,8 +645,8 @@ class Arm:
                         t_c, p_c, g_c = track[m][0]
                         advance, lag = goal[m] - g_c, abs(goal[m] - pos[m])
                         covered = (pos[m] - p_c) * math.copysign(1.0, advance)
-                        if (now - t_c >= CONTACT_WINDOW_S and abs(advance) >= CONTACT_MIN_ADVANCE
-                                and lag >= CONTACT_LEAD and covered < CONTACT_FRACTION * abs(advance)):
+                        if (now - t_c >= CONTACT_WINDOW_S and abs(advance) >= CONTACT_MIN_ADVANCE and lag >= CONTACT_LEAD
+                                and covered < min(CONTACT_FRACTION * abs(advance), CONTACT_CREEP)):
                             status, blocked = "blocked", m
                             notes.append(f"{m} met resistance while moving: {lag / TICKS_PER_DEG:.1f} deg behind its "
                                          f"goal, covered {covered / TICKS_PER_DEG:.1f} of "
@@ -721,30 +740,39 @@ class Arm:
     def plan_line(self, start_deg, target_mm, jaws_down: bool, multi_seed: bool = True) -> list:
         """IK for every <= 30 mm segment of the straight TCP line, all before any motion; rejects branch jumps and
         poses near the bench. Returns readings (LeRobot deg, JOINTS order) per segment end. Only the first segment
-        searches all IK seeds (multi_seed=False: none do, for short corrective steps)."""
-        start_mm, _ = self.tcp(start_deg)
+        searches all IK seeds (multi_seed=False: none do, for short corrective steps). jaws_down turns the jaws toward
+        straight down along the line (MAX_TURN_DEG a segment at most) without twisting them (wrist_roll is held), and
+        where the wrist cannot reach straight down they stay as near it as it goes."""
+        start_mm, start_axis = self.tcp(start_deg)
         target_mm = np.asarray(target_mm, float)
         if target_mm[2] - self.bench_z < CLEAR_TIP_MM and target_mm[2] < start_mm[2]:
             raise LimitError(f"the target is {target_mm[2] - self.bench_z:.0f} mm above the bench; the TCP must stay "
                              f"at least {CLEAR_TIP_MM:.0f} mm above it")
-        n = max(1, math.ceil(np.linalg.norm(target_mm - start_mm) / MAX_SEGMENT_MM))
+        turn = angle_from_down(start_axis) if jaws_down else 0.0
+        n = max(1, math.ceil(np.linalg.norm(target_mm - start_mm) / MAX_SEGMENT_MM), math.ceil(turn / MAX_TURN_DEG))
         seg_mm = np.linalg.norm(target_mm - start_mm) / n
         lo, hi = self.lo_deg + self.offsets, self.hi_deg + self.offsets  # IK works in model angles
         q, plan = np.asarray(start_deg, float) + self.offsets, []
+        roll = JOINTS.index("wrist_roll")
         for k in range(1, n + 1):
             p = (start_mm + (target_mm - start_mm) * k / n) / 1000.0
-            try:
-                sol = solve_ik(self.kin, q, p, jaws_down, lo, hi, multi_seed=(k == 1 and multi_seed))
+            ik = dict(axis=toward_down(start_axis, k / n), weights=JAWS_DOWN_WEIGHTS, pin=True) if jaws_down else {}
+            if jaws_down:
+                lo[roll] = hi[roll] = q[roll]
+            try:  # a jaws_down line warm-starts every segment and only searches all seeds when that fails
+                sol = solve_ik(self.kin, q, p, jaws_down, lo, hi, multi_seed=(k == 1 and multi_seed and not jaws_down),
+                               **ik)
             except ValueError:
                 try:
-                    sol = solve_ik(self.kin, q, p, jaws_down, lo, hi)
+                    sol = solve_ik(self.kin, q, p, jaws_down, lo, hi, **ik)
                 except ValueError as e:
                     raise LimitError(f"segment {k}/{n} toward {np.round(p * 1000, 1).tolist()} mm: {e}") from e
             jump = np.abs(sol.joints_deg - q)
             # The wrist sits ~100 mm from the TCP, so honest position IK turns it ~17 deg per 30 mm, and up to ~27 deg
             # per 20 mm with the shoulder at its back stop (measured); an IK branch flip swings some joint 60+ deg
-            # (wrist_roll was seen flipping 265 deg). 45 deg/30 mm, at least 15, separates the two.
-            allowed = np.full(5, max(15.0, 45.0 * seg_mm / MAX_SEGMENT_MM))
+            # (wrist_roll was seen flipping 265 deg). 45 deg/30 mm, at least 15, separates the two. Turning the jaws
+            # down reconfigures the arm as well, by up to TURN_SWING times the turn.
+            allowed = np.full(5, max(15.0, 45.0 * seg_mm / MAX_SEGMENT_MM + TURN_SWING * turn / n))
             allowed[JOINTS.index("wrist_roll")] = 45.0
             if (jump > allowed).any():
                 worst = int(np.argmax(jump / allowed))
@@ -772,6 +800,9 @@ class Arm:
         if not all(m in move.final for m in JOINTS):
             return CartesianReceipt(move.status, move, target, planned, [], None, len(plan), [])
         final_mm, axis = self.tcp([move.final[m] for m in JOINTS])
+        if jaws_down and angle_from_down(axis) > JAWS_DOWN_TOL_DEG:
+            move.notes.append(f"jaws_down: the jaws point {angle_from_down(axis):.0f} deg from straight down, as near as "
+                              "the wrist reaches here (wrist_flex at its limit); the lower the TCP, the nearer down")
         error = round(float(np.linalg.norm(final_mm - target)), 1)
         status = move.status if move.status not in ("reached", "settled") else (
             "reached" if error <= tol_mm else "off_target")

@@ -13,7 +13,8 @@ from lerobot.robots.so_follower import SO101Follower, SO101FollowerConfig
 import arm as arm_module
 import calibration
 from arm import GRIPPER, JOINTS, TORQUE_LIMIT, Arm, ArmError, BusyError, LimitError, ThermalError
-from sim import SimBus
+from kinematics import angle_from_down
+from sim import FIELD_REST_TICKS, SimBus
 
 DATA = Path(__file__).parent / "data"
 
@@ -268,6 +269,31 @@ def test_strong_stiction_is_overcome_without_hunting() -> None:
     arm.disconnect()
 
 
+def test_a_joint_restarting_after_waiting_at_a_waypoint_is_not_called_blocked() -> None:
+    # 2026-10-16, mid jaws_down move: the elbow's goal waited at a waypoint for the shoulder, the elbow stopped and
+    # stuck, and its second breakaway (~90 ticks of lead) was taken for contact: blocked with nothing in the way.
+    arm, bus = make()
+    bus.stiction["elbow_flex"] = (90.0, 15.0)
+    st = arm.state()
+    pan, elbow = st.ticks["shoulder_pan"], st.ticks["elbow_flex"]
+    path = [{"shoulder_pan": pan + 400, "elbow_flex": elbow - 150}, {"shoulder_pan": pan + 400, "elbow_flex": elbow - 300}]
+    with arm._motion_slot():
+        r = arm._run(path, 20 * arm_module.TICKS_PER_DEG, 11, 20.0)
+    assert r.status in ("reached", "settled") and r.blocked is None, r
+    arm.disconnect()
+
+
+def test_a_joint_slowed_by_load_is_not_called_blocked() -> None:
+    # 2026-10-16: the elbow lifting the stretched-out arm covered 33 ticks in 0.5 s against a 20 deg/s goal (29 %, the
+    # contact rule's 30 % line) and was called blocked. Steadily slow is not held: a hand lets a joint creep a few ticks.
+    arm, bus = make()
+    bus.speed = 60.0  # every joint at most ~5 deg/s, as if load-limited
+    pan = arm.state().joints_deg["shoulder_pan"]
+    r = arm.move_joints({"shoulder_pan": pan + 15}, speed_dps=20)
+    assert r.status in ("reached", "settled") and r.blocked is None, r
+    arm.disconnect()
+
+
 def test_rig_offsets_shift_kinematics_and_bounds() -> None:
     config = SO101FollowerConfig(port="unused", id="exp23_follower", calibration_dir=DATA,
                                  disable_torque_on_disconnect=False)
@@ -376,6 +402,29 @@ def test_cartesian_line_and_refusal_before_motion() -> None:
         raise AssertionError("an unreachable line was accepted")
     assert max(abs(bus.pos[m] - before[m]) for m in bus.pos) < 1, "moved before the whole line was solved"
     assert np.isfinite(arm.tcp_now()).all()
+    arm.disconnect()
+
+
+def test_jaws_down_from_rest_tilts_as_far_as_the_wrist_goes_and_keeps_the_twist() -> None:
+    # The field arm of 2026-10-16 at its rest pose (jaws ~69 deg off vertical). Agents' jaws_down approach 9 cm over
+    # the bench was refused at segment 1: straight down there needs wrist_flex ~114 deg, past its 90.5 limit.
+    config = SO101FollowerConfig(port="unused", id="exp23_follower", calibration_dir=DATA,
+                                 disable_torque_on_disconnect=False)
+    cal = SO101Follower(config).calibration
+    offsets = {"shoulder_pan": 0.0, "shoulder_lift": -102.37, "elbow_flex": 85.98, "wrist_flex": -14.49,
+               "wrist_roll": 0.0}
+    rig = calibration.RigCalibration(offsets, np.eye(4).tolist(), [0.0, 0.0, 0.0], [0.0, 0.0, -1.0], 0.0, 6.19, 0.0,
+                                     4.8, 12.2, "2026-10-16T15:10:13", "exp23_follower", "abc", "SIM")
+    arm = Arm(SimBus(cal, start_ticks=FIELD_REST_TICKS), cal, rig=rig, motor_calibration_sha256="abc")
+    roll = arm.state().joints_deg["wrist_roll"]
+    high = arm.move_to([261.5, -6.0, 89.0], jaws_down=True, speed_dps=40)
+    assert high.status in ("reached", "off_target") and high.tcp_error_mm < 10, high
+    assert 5 < angle_from_down(high.jaw_axis) < 25 and any("jaws_down" in n for n in high.move.notes), high
+    low = arm.move_by([0.0, 0.0, -45.0], jaws_down=True, speed_dps=40)
+    assert low.status in ("reached", "off_target") and angle_from_down(low.jaw_axis) < 5, low
+    assert abs(arm.state().joints_deg["wrist_roll"] - roll) < 2, "jaws_down twisted the jaws"
+    print(f"  jaws_down from rest: {angle_from_down(high.jaw_axis):.0f} deg off vertical 9 cm up, "
+          f"{angle_from_down(low.jaw_axis):.1f} deg 4.5 cm up")
     arm.disconnect()
 
 
